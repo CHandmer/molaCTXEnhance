@@ -21,55 +21,127 @@ from libtiff import TIFF
 import scipy as sp
 import os
 import sys
+import time
+import tensorflow as tf
 from tensorflow import keras
 from keras.models import Sequential, Model
 from keras.layers import Dense, Input, Conv2D, UpSampling2D, Concatenate, Add, Multiply, LeakyReLU, BatchNormalization, Dropout
-
 from scipy.interpolate import RectBivariateSpline
-
 from io import StringIO
+import multiprocessing
 
+def rescale(img, scale):
+    """
+    Downscales an image by the factor given in parameter 'scale', which should be a power of 2.
+    The dimensions of the image should be an integer multiple of scale.
+    """
+    sh = list(img.shape)
+    result = np.zeros((sh[0] // scale, sh[1] // scale))
+    for i in range(0, sh[0], scale):
+        for j in range(0, sh[1], scale):
+            result[i//scale,j//scale] = np.average(img[i:i+scale,j:j+scale])
+    return result
+
+def rescale_generic(img_input, scale):
+    """
+    Downscales an image by an arbitrary integer factor given in parameter 'scale'.
+    The dimensions of the image do not need to be an integer multiple of scale, in which case the image
+    will be extended along the right and bottom edges.
+    """
+    sh = list(img_input.shape)
+    rsh = (int(np.ceil(sh[0] / scale)), int(np.ceil(sh[1] / scale)))
+    if (rsh[0] * scale > sh[0] or rsh[1] * scale > sh[1]):
+        img = np.zeros((rsh[0] * scale, rsh[1] * scale), img_input.dtype)
+        img[:sh[0],:sh[1]] = img_input
+        for i in range(0, (sh[0] // scale) + 1):
+            img[i*scale:(i+1)*scale,sh[1]:rsh[1]*scale] = np.average(img_input[i*scale:(i+1)*scale,(rsh[1] - 1)*scale:sh[1]])
+        for i in range(0, (sh[1] // scale) + 1):
+            img[sh[0]:rsh[0]*scale,i*scale:(i+1)*scale,] = np.average(img_input[(rsh[0] - 1)*scale:sh[0],i*scale:(i+1)*scale])
+        img[(rsh[0] - 1)*scale:rsh[0]*scale,(rsh[1] - 1)*scale:rsh[1]*scale] = np.average(img_input[(rsh[0] - 1)*scale:sh[0],(rsh[1] - 1)*scale:sh[1]])
+        img[(rsh[0] - 1)*scale:sh[0],(rsh[1] - 1)*scale:sh[1]] = img_input[(rsh[0] - 1)*scale:sh[0],(rsh[1] - 1)*scale:sh[1]]
+    else:
+        img = img_input
+
+    # https://scipython.com/blog/binning-a-2d-array-in-numpy/
+    shape = (rsh[0], scale,
+             rsh[1], scale)
+    return img.reshape(shape).mean(-1).mean(1)
 
 def findBestEnhanceModel(lat,lon):
-    # Find all models in the model dir, pick the one on the closest latitude, then longitude.
-    allModels=os.listdir("../models/")
+    """Find all models in the model dir, pick the one on the closest latitude, then longitude."""
+    dir = "../models/"
+    allModels=os.listdir(dir)
     geoModels=[allModels[i] for i in range(len(allModels)) if allModels[i][:14]=="model_enhance_"]
     allTilesLL = np.array([np.genfromtxt(StringIO(gm[14:]),delimiter="_") for gm in geoModels])
     dtype = [('lat dist',float),('lon dist',float),('lat',float),('lon',float)]
     allTilesLLMetric = np.array([(np.abs(v[0]-lat),np.abs(v[1]-lon),v[0],v[1]) for v in allTilesLL],dtype=dtype)
     bestModel=np.sort(allTilesLLMetric,order=['lat dist','lon dist'])[0]
-    print("best model at (" + str(bestModel[2]) + "," + str(bestModel[3]) + "), distance (" + \
+    print("[ LOG ] best model at (" + str(bestModel[2]) + "," + str(bestModel[3]) + "), distance (" + \
           str(bestModel[0]) + "," + str(bestModel[1]) + ")")
     bestModel2=np.array([bestModel[i] for i in range(2,4)]).astype(np.int)
-    fileName = "model_enhance_"+str(bestModel2[0])+"_"+str(bestModel2[1])
+    fileName = dir+"model_enhance_"+str(bestModel2[0])+"_"+str(bestModel2[1])
     return fileName
 
 def rescaleDown(lims,data):
     return np.interp(data,lims,(0,1))
+
 def rescaleUp(lims,data):
     return np.interp(data,(0,1),lims)
 
 def openDem(path):
+    print("[ LOG ] Opening DEM... " + path)
     return TIFF.open(path).read_image()
 
 def getMola(latu,latl,lonl,lonr,mola):
-    return mola[128*(90-latu):128*(90-latl),128*(180+lonl):128*(180+lonr)]
+    # Using a slight offset to get better alignment with CTX images, resulting in dramatic improvement
+    m = mola[128*(90-latu)+1:128*(90-latl)+1,128*(180+lonl)+2:128*(180+lonr)+2]
+    if m.shape[1] == 510:
+        new = np.zeros((m.shape[0], 512))
+        new[:,:510] = m[:,:]
+        new[:,510] = mola[128*(90-latu)+1:128*(90-latl)+1,0]
+        new[:,511] = mola[128*(90-latu)+1:128*(90-latl)+1,1]
+        m = new
+    if m.shape[0] == 511:
+        new = np.zeros((512, 512))
+        new[:511,:] = m[:,:]
+        new[511,:] = m[510,:]
+        m = new
+    return m.astype(np.int16)
+
+def getCTXFilename(prefix, lat, lon):
+    return prefix + "Lab_CTX-Mosaic_beta01_E"+str(lon).zfill(3+int(0.5-0.5*np.sign(lon)))+ \
+           "_N"+str(lat).zfill(2+int(0.5-0.5*np.sign(lat)))+".tif"
 
 def getCTX(lat,lon):
     # return a 2 degree square tile of CTX data referenced by lat and lon.
-    dire = "../data/"
-    file = "Murray-Lab_CTX-Mosaic_beta01_E"+str(lon).zfill(3+int(0.5-0.5*np.sign(lon)))+ \
-           "_N"+str(lat).zfill(2+int(0.5-0.5*np.sign(lat)))+".tif"
+    dire = "../data/zips/"
+    file = getCTXFilename("Murray-", lat, lon)
+    if not os.path.isfile(dire+file):
+        # Inconsistencies in the naming...
+        file = getCTXFilename("Murray", lat, lon)
     try:
-        return TIFF.open(dire+file).read_image()
+        img = TIFF.open(dire+file).read_image()
+        # Some of the 2x2 tiles have missing data along the edges. Simply copy the adjacent row/column
+        if img[1,0] == 0 and img[2,0] == 0 and img[3,0] == 0 and img[1,1] > 0 and img[2,1] > 0 and img[3,1] > 0:
+            x = img[:,1]
+            img[:,0] = x
+        if img[0,1] == 0 and img[0,2] == 0 and img[0,3] == 0 and img[1,1] > 0 and img[1,2] > 0 and img[1,3] > 0:
+            x = img[1, :]
+            img[0, :] = x
+        # Fill in areas with missing data to avoid creating sharp edges
+        # Don't do this when training the enhance model!
+        img[img == 0] = 128
+        return img
     except:
         print("ERROR: Could not find "+dire+file+", inserted zeros.")
         return np.zeros((23710,23710))
 
 def saveDem(path,dem,split=False):
     if not split:
+        # 32bit precision is plenty
+        converted = dem.astype(np.float32)
         tif = TIFF.open(path+".tif", mode='w')
-        tif.write_image(dem)
+        tif.write_image(converted)
     else:
         sf = int(np.ceil(dem.shape[0]/8192))
         size = int(dem.shape[0]/sf)
@@ -78,16 +150,8 @@ def saveDem(path,dem,split=False):
                 tif = TIFF.open(path+"_"+str(i)+"_"+str(j)+".tif", mode='w')
                 tif.write_image(dem[i*size:(i+1)*size,j*size:(j+1)*size])
 
-                
 def ctxS(data):
     return rescaleDown((0,255),data)
-
-def ctxG(data):
-    return rescaleUp((0,255),data)
-    
-def getInterpolator(grid):
-    # Do actual lat lon for this.
-    return RectBivariateSpline(np.arange(grid.shape[0]),np.arange(grid.shape[1]),grid)
 
 def getInterpolatedCTX(lats,lons,ctx,latlims,lonlims):
     eps = 1e-6
@@ -95,14 +159,14 @@ def getInterpolatedCTX(lats,lons,ctx,latlims,lonlims):
         return "Error, selected area must be between "+str(latlims)+" and E"+str(lonlims)+"."
     # Work out which part of ctx we want and at what resolution
     # lim# represents the extent of the ctx sub-space selection
-    lim1 = np.maximum(0,int(np.floor((np.min(lons)-lonlims[0])/(lonlims[1]-lonlims[0])*ctx.shape[1])))
+    lim1 = np.maximum(0, int(np.floor((np.min(lons) - lonlims[0]) / (lonlims[1] - lonlims[0]) * ctx.shape[1])))
     lim2 = int(np.ceil((np.max(lons)-lonlims[0])/(lonlims[1]-lonlims[0])*ctx.shape[1]))
     lim3 = np.maximum(0,int(np.floor((latlims[1]-np.max(lats))/(latlims[1]-latlims[0])*ctx.shape[0])))-1
     lim4 = int(np.ceil((latlims[1]-np.min(lats))/(latlims[1]-latlims[0])*ctx.shape[0]))-1
     # Calculate stride.
     lonStride = int(np.maximum(1,np.floor(0.5*(lim2-lim1)/(len(lons)-1))))
     latStride = int(np.maximum(1,np.floor(0.5*(lim4-lim3)/(len(lats)-1))))
-    #print(lonStride, latStride)
+    
     # Now calculate the actual lats and lons represented by this sampling
     lonInd = np.arange(lim1,lim2+1,lonStride)
     latInd = np.arange(lim3,lim4+1,latStride)
@@ -110,27 +174,43 @@ def getInterpolatedCTX(lats,lons,ctx,latlims,lonlims):
     lats2 = np.flip(latlims[1]-latInd/ctx.shape[0]*(latlims[1]-latlims[0]))
     
     # Calculate interpolator
-    interp = RectBivariateSpline(lats2, lons2, ctx[lim3:lim4+1:latStride,lim1:lim2+1:lonStride])
+    interp = RectBivariateSpline(lats2, lons2, rescale_generic(ctx[lim3:lim4+1,lim1:lim2+1], lonStride))
     return interp(lats,lons)
 
-def getInterpolatedCTXBig(lats,lons,ctx,latlims,lonlims):
-    trigger = 512
+def getInterpolatedCTXBigOptRow(args):
+    (trigger,split,i,lats,lons,ctx,latlims,lonlims) = args
+    result = np.zeros((trigger, len(lons)))
+    for j in range(split):
+        # Take care of how latitude is represented from bottom up
+        result[0:trigger,j*trigger:(j+1)*trigger] = getInterpolatedCTX(lats[(split-1-i)*trigger:(split-1-i+1)*trigger],
+                                        lons[j*trigger:(j+1)*trigger],
+                                        ctx,
+                                        latlims,#ctx, latlims, lonlims are a matched triplet.
+                                        lonlims)
+    return result
+
+def getInterpolatedCTXBigOpt(pool,lats,lons,ctx,latlims,lonlims):
+    # In case of any problems, lower this to 512
+    trigger = 2048
+
     if len(lats) < trigger+1:
         return getInterpolatedCTX(lats,lons,ctx,latlims,lonlims)
     else:
         split = int(len(lats)/trigger) # Expect this to be an integer power of 2
         output = np.zeros((len(lats),len(lons)))
+        args = []
         for i in range(split):
-            for j in range(split):
-                # Take care of how latitude is represented from bottom up
-                output[i*trigger:(i+1)*trigger,j*trigger:(j+1)*trigger] \
-                    = getInterpolatedCTX(lats[(split-1-i)*trigger:(split-1-i+1)*trigger],
-                                         lons[j*trigger:(j+1)*trigger],
-                                         ctx,
-                                         latlims,#ctx, latlims, lonlims are a matched triplet.
-                                         lonlims)
+            args.append([trigger, split, i, lats, lons, ctx, latlims, lonlims])
+        
+        # There is a slight advantage in running this parallel especially when enhancing beyond 115m
+        results = pool.map(getInterpolatedCTXBigOptRow, args)
+
+        for i in range(split):
+            # Take care of how latitude is represented from bottom up
+            output[i*trigger:(i+1)*trigger,:] = results[i]
+
         return output
-                                                                
+
 
 def getInterpolatedMOLA(lats,lons,mola,latlims,lonlims):
     mol = getMola(latlims[1],latlims[0],lonlims[0],lonlims[1],mola)
@@ -146,6 +226,7 @@ def getInterpolatedMOLA(lats,lons,mola,latlims,lonlims):
     # Calculate stride.
     lonStride = int(np.maximum(1,np.floor(0.5*(lim2-lim1)/(len(lons)-1))))
     latStride = int(np.maximum(1,np.floor(0.5*(lim4-lim3)/(len(lats)-1))))
+    
     # Now calculate the actual lats and lons represented by this sampling
     lonInd = np.arange(lim1,lim2+1,lonStride)
     latInd = np.arange(lim3,lim4+1,latStride)
@@ -155,9 +236,6 @@ def getInterpolatedMOLA(lats,lons,mola,latlims,lonlims):
     # Calculate interpolator
     interp = RectBivariateSpline(lats2, lons2, mol[lim3:lim4+1:latStride,lim1:lim2+1:lonStride])
     return interp(lats,lons)
-
-def safeDivide(a,b):
-    return np.abs(np.sign(b))*a/(1-np.abs(np.sign(b))+b)
 
 def interpPiece(model,im,dem,rescale_lims,dim,enhance=False):
     # im has twice resolution of dem, matches model trained shape
@@ -175,8 +253,9 @@ def interpPiece(model,im,dem,rescale_lims,dim,enhance=False):
         #                           np.arange(0,2*dim,2),
         #                           dem,kx=4,ky=4)(np.arange(0,2*dim,1), np.arange(0,2*dim,1))
 
-
 def interpBigImg(model,ctx,mola,rescale_lims,padding,dim,enhance=False):
+    """ For better GPU utilisation calling predict on batches """
+    sT = time.time()
     csh = list(ctx.shape)
     # Pad output by the useless margins.
     upad = padding[0]
@@ -208,34 +287,57 @@ def interpBigImg(model,ctx,mola,rescale_lims,padding,dim,enhance=False):
     # fill in, then do right and bottom edges.
     # dim is the size of the model mola input square, ie half of the ctx input.
     stride = 2*dim-pad-upad
-    for i in range(0,csh[0]-2*dim,stride):
+
+    num_samples = (csh[1] - 2 * dim) // stride + 1
+
+    for i in range(0,csh[0]-2*dim,stride):    
+        if enhance:
+            batch = np.zeros((num_samples, 2 * dim, 2 * dim, 1))
+            for j in range(0,csh[1]-2*dim,stride):
+                batch[j//stride,:,:,0] = ctxS(ctxInput[i:i+2*dim,j:j+2*dim])
+        else:
+            batch = np.zeros((num_samples, dim, dim, 1))
+            for j in range(0,csh[1]-2*dim,stride):
+                batch[j//stride,:,:,0] = rescaleDown(rescale_lims, molaInput[i:i+2*dim:2,j:j+2*dim:2])
+        res = model.predict_on_batch(batch)
         for j in range(0,csh[1]-2*dim,stride):
-            output[i:i+2*dim,j:j+2*dim][upad:-pad,upad:-pad] = interpPiece(model,ctxInput[i:i+2*dim,j:j+2*dim],
-                                                        molaInput[i:i+2*dim:2,j:j+2*dim:2],
-                                                                           rescale_lims,dim,enhance)[upad:-pad,upad:-pad]
+            output[i:i+2*dim,j:j+2*dim][upad:-pad,upad:-pad] = rescaleUp(rescale_lims, res[j//stride,:,:,0])[upad:-pad,upad:-pad]
+
+    
+    if enhance:
+        batch = np.zeros((2, num_samples, 2 * dim, 2 * dim, 1))
+        for i in range(0,csh[0]-2*dim,stride):
+            batch[0,i//stride,:,:,0] = ctxS(ctxInput[i:i+2*dim,-2*dim:])
+            batch[1,i//stride,:,:,0] = ctxS(ctxInput[-2*dim:,i:i+2*dim])
+    else:
+        batch = np.zeros((2, num_samples, dim, dim, 1))
+        for i in range(0,csh[1]-2*dim,stride):
+            batch[0,i//stride,:,:,0] = rescaleDown(rescale_lims, molaInput[i:i+2*dim:2,-2*dim::2])
+            batch[1,i//stride,:,:,0] = rescaleDown(rescale_lims, molaInput[-2*dim::2,i:i+2*dim:2])
+    res0 = model.predict_on_batch(batch[0,:,:,:,0])
+    res1 = model.predict_on_batch(batch[1,:,:,:,0])
     for i in range(0,csh[0]-2*dim,stride):
-        output[i:i+2*dim,-2*dim:][upad:-pad,upad:-pad] = interpPiece(model,ctxInput[i:i+2*dim,-2*dim:],
-                                                   molaInput[i:i+2*dim:2,-2*dim::2],
-                                                                           rescale_lims,dim,enhance)[upad:-pad,upad:-pad]
-        output[-2*dim:,i:i+2*dim][upad:-pad,upad:-pad] = interpPiece(model,ctxInput[-2*dim:,i:i+2*dim],
-                                                   molaInput[-2*dim::2,i:i+2*dim:2],
-                                                                           rescale_lims,dim,enhance)[upad:-pad,upad:-pad]
-    output[-2*dim:,-2*dim:][upad:-pad,upad:-pad] = interpPiece(model,ctxInput[-2*dim:,-2*dim:],
-                                          molaInput[-2*dim::2,-2*dim::2],
-                                                                           rescale_lims,dim,enhance)[upad:-pad,upad:-pad]
+        output[i:i+2*dim,-2*dim:][upad:-pad,upad:-pad] = rescaleUp(rescale_lims, res0[i//stride,:,:,0])[upad:-pad,upad:-pad]
+        output[-2*dim:,i:i+2*dim][upad:-pad,upad:-pad] = rescaleUp(rescale_lims, res1[i//stride,:,:,0])[upad:-pad,upad:-pad]
+
+    output[-2*dim:,-2*dim:][upad:-pad,upad:-pad] = interpPiece(model, ctxInput[-2*dim:,-2*dim:], molaInput[-2*dim::2,-2*dim::2],
+                                                               rescale_lims, dim, enhance)[upad:-pad,upad:-pad]
+    print("[ LOG ] interpBigImg " + str(int(time.time() - sT)) + " sec")
     return output[upad:-pad,upad:-pad]
 
 # This is a bit ugly because originally there was a single neural network and now interpolation and correction
 # are done separately.
 
 def getTrainingData(index,size,molaTrain,ctxTrain):
+    molaTrainScaled = rescale(molaTrain[index[0]:index[0]+size,index[1]:index[1]+size], 2)
     return [ctxTrain[index[0]:index[0]+size,index[1]:index[1]+size],
-            molaTrain[index[0]:index[0]+size:2,index[1]:index[1]+size:2],
+            molaTrainScaled,
             molaTrain[index[0]:index[0]+size,index[1]:index[1]+size]]
 
 def getTrainingDataCTX(index,size,molaTrain,ctxTrain,molaTrainInterp):
+    molaTrainScaled = rescale(molaTrain[index[0]:index[0]+size,index[1]:index[1]+size], 2)
     return [ctxTrain[index[0]:index[0]+size,index[1]:index[1]+size],
-            molaTrain[index[0]:index[0]+size:2,index[1]:index[1]+size:2],
+            molaTrainScaled,
             (molaTrain-molaTrainInterp)[index[0]:index[0]+size,index[1]:index[1]+size]]
 
 # Generate neural nets
@@ -263,13 +365,13 @@ def trainInterp(model,dim,demRes,molaLims,molaTrain,ctxTrain):
         y[i,:,:,0] = rescaleDown(molaLims,trainingSet[i][2])
     # train
     # 10 epochs is heaps. Overfitting can be a real problem here.
-    model.fit(X2,y, epochs=10, batch_size=64,validation_split=0.2)
+    model.fit(X2,y, epochs=10, batch_size=8,validation_split=0.2)
     # Evaluate
-    test = model.evaluate(X2,y, batch_size=64)
+    test = model.evaluate(X2,y, batch_size=8)
     if test<10**-5:
-        print("Interpolator probably okay.")
+        print("[ LOG ] Interpolator probably okay.")
     else:
-        print("Interpolator loss above 10^-5, possibly not good enough.")
+        print("[ LOG ] Interpolator loss above 10^-5, possibly not good enough.")
     # Save
     model.save('../models/model_interp_'+str(lat)+"_"+str(lon))
     # Later rename the good one "interp1" to be generically used.
@@ -327,46 +429,42 @@ def trainEnhance(model,dim,demRes,mola2lims,molaTrain,ctxTrain,molaTrainInterp,e
     #lr_decay_callback = keras.callbacks.LearningRateScheduler(lr_decay, verbose=False)
 
     #opt = keras.optimizers.Adam(learning_rate=0.0001) # optimizer=opt # needs to go in compile
-    model.fit(X1,y, epochs=epochs, batch_size=64, validation_split=0.2)#, callbacks=[lr_decay_callback], verbose=1)
+    model.fit(X1,y, epochs=epochs, batch_size=16, validation_split=0.2)#, callbacks=[lr_decay_callback], verbose=1)
 
     # At the end of training there's some thing causing a huge waste of time, and it's getting worse.
     # Probably due to driver problems but I don't want to touch that...
     
     # Evaluate
-    print("Evaluating model")
-    test = model.evaluate(X1[-640:],y[-640:], batch_size=64)
+    print("[ LOG ] Evaluating model")
+    test = model.evaluate(X1[-640:],y[-640:], batch_size=16)
     if test<1e-3:
-        print("Enhancer probably okay.")
+        print("[ LOG ] Enhancer probably okay.")
     else:
-        print("Enhancer loss above 1e-3, possibly not good enough.")
+        print("[ LOG ] Enhancer loss above 1e-3, possibly not good enough.")
     # Save
     model.save('../models/model_enhance_'+str(lat)+"_"+str(lon))
-    print("returning model")
+    print("[ LOG ] returning model")
     return model
 
-def enhanceMain(lat, lon, res):
+def enhanceMain(pool, mola, lat, lon, res, model_enhance = None):
     # defines 4 square degree graticule of given planet defined by lat, lon. Top left corner. 
     # Enhances until resolution better than res. User expected to know limits of imagery, around 5 m for CTX. 
     tileSize=4 # 4 degrees x 4 degree tiles, corresponding to Murray lab CTX data
     dim=16 # dimension of origin DEM tile, image and output are 2*dim.
+    interp_dim = dim
     planetRadius=3389500 #m
     
-    demPath = "../data/dems/Mars_MGS_MOLA_DEM_mosaic_global_463m.tif"
+    print("[ LOG ] planetary DEM enhancement tool operating on " + str(tileSize) + " degree tile from")
+    print("[ LOG ] latitude: [" + str(lat) + "," + str(lat-tileSize) + "], longitude: [" + str(lon) + "," + str(lon+tileSize)+"].")
     
-    print("planetary DEM enhancement tool operating on " + str(tileSize) + " degree tile from")
-    print("latitude: [" + str(lat) + "," + str(lat-tileSize) + "], longitude: [" + str(lon) + "," + str(lon+tileSize)+"].")
-    
-    # Get mola
-    print("Opening DEM...")
-    mola = openDem(demPath)
     initialRes = 2*np.pi*3389500/mola.shape[1]
-    print("Initial DEM resolution "+str(initialRes)+" m.")
+    print("[ LOG ] Initial DEM resolution "+str(initialRes)+" m.")
     numEnhance = int(np.ceil(np.log2(462/res)))
-    print("Will enhance " + str(numEnhance)+" time(s), a total resolution increase of "+str(2**numEnhance)+" to " +
+    print("[ LOG ] Will enhance " + str(numEnhance)+" time(s), a total resolution increase of "+str(2**numEnhance)+" to " +
           str(initialRes/2**numEnhance) + " m.")
 
     # Get ctx
-    print("Opening CTX...")
+    print("[ LOG ] Opening CTX...")
     ctx = np.concatenate([
             np.concatenate([
                 getCTX(lat,lon)
@@ -374,7 +472,7 @@ def enhanceMain(lat, lon, res):
           for lon in range(lon,lon+tileSize,2)],axis=1)
 
     # Build training set
-    print("Building training data tiles...")
+    print("[ LOG ] Building training data tiles...")
     demRes = getMola(lat,lat-tileSize,lon,lon+tileSize,mola).shape[0]
     ctxTrain=getInterpolatedCTX(np.arange(lat-tileSize,lat,tileSize/demRes),
                                 np.arange(lon,lon+tileSize,tileSize/demRes),
@@ -387,34 +485,30 @@ def enhanceMain(lat, lon, res):
                                     [lat-tileSize,lat],
                                     [lon,lon+tileSize])
 
-    print("Initializing scaling helper functions.")
-    # Rescale data to within 0,1 for machine learning stuff. Leave some room for peaks.
+    print("[ LOG ] Initializing scaling helper functions.")
+    # Rescale data to within 0,1 for machine learning stuff. Leave some more room for peaks. Relatively flat tiles can shift quite a bit.
     molaMin=np.min(molaTrain)
     molaMax=np.max(molaTrain)
-    molaLims=(1.02*molaMin-0.02*molaMax,1.02*molaMax-0.02*molaMin)
-
-    def molaS(data):
-        return rescaleDown(molaLims,data)
-    def molaG(data):
-        return rescaleUp(molaLims,data)
+    molaLims=(1.04*molaMin-0.04*molaMax,1.04*molaMax-0.04*molaMin)
 
     # Get models (search for nearby ones, build dir, or start from scratch)
-    print("Loading generic interp model.")
+    print("[ LOG ] Loading generic interp model.")
     try:
-        model_interp = keras.models.load_model('../models/model_interp1')
-        print("Loaded interp model.")
+        model_interp = keras.models.load_model('../models/model_interp_'+str(lat)+"_"+str(lon))
+        print("[ LOG ] Loaded interp model.")
     except:
-        print("No interp model found, building one from scratch...")
-        print("Generating interp model.")
+        print("[ LOG ] No interp model found, building one from scratch...")
+        print("[ LOG ] Generating interp model.")
         # generate interp model
-        model_interp = generateInterp(dim)
+        model_interp = generateInterp(interp_dim)
         print(model_interp.summary())
         # train interp
-        model_interp = trainInterp(model_interp,dim,demRes,molaLims,molaTrain,ctxTrain)
+        model_interp = trainInterp(model_interp,interp_dim,demRes,molaLims,molaTrain,ctxTrain)
 
-    print("Generating interp error tile...")
-    interpPadding=[6,8]
-    molaTrainInterp = interpBigImg(model_interp,ctxTrain,molaTrain[::2,::2],molaLims,interpPadding,dim,False)
+    print("[ LOG ] Generating interp error tile...")
+    #interpPadding=[interp_dim // 3, interp_dim // 3]
+    interpPadding=[6, 8]
+    molaTrainInterp = interpBigImg(model_interp, ctxTrain, rescale(molaTrain, 2), molaLims, interpPadding, interp_dim, False)
     # Keep an eye on how pathological the corrections are. Hopefully they're smoothish.
     
     # Add to scaling functions
@@ -422,56 +516,57 @@ def enhanceMain(lat, lon, res):
     mola2Max=np.max(molaTrain-molaTrainInterp)
     mola2lims=(mola2Min,mola2Max)
     
-    def molaS2(data):
-        return rescaleDown(mola2lims,data)
-    def molaG2(data):
-        return rescaleUp(mola2lims,data)
-
-    print("Loading closest enhance model.")
-    try:
-        # Build directory of enhance models.
-        bestModel = findBestEnhanceModel(lat,lon)
-        model_enhance = keras.models.load_model('../models/'+bestModel)
-        print("Loaded generic enhance model.")
-    except:
-        print("No enhance model found, building from scratch...")
-        # generate enhance model
-        model_enhance = generateEnhance(dim)
-        # train enhance model
-        model_enhance = trainEnhance(model_enhance,dim,demRes,mola2lims,molaTrain,ctxTrain,molaTrainInterp,50,lat,lon)
+    if model_enhance is None:
+        try:
+            print("[ LOG ] Loading closest enhance model.")
+            # Build directory of enhance models.
+            bestModel = findBestEnhanceModel(lat,lon)
+            model_enhance = keras.models.load_model(bestModel)
+            print("[ LOG ] Loaded generic enhance model.")
+        except:
+            print("[ LOG ] No enhance model found, building from scratch...")
+            # generate enhance model
+            model_enhance = generateEnhance(dim)
+            # train enhance model
+            model_enhance = trainEnhance(model_enhance,dim,demRes,mola2lims,molaTrain,ctxTrain,molaTrainInterp,50,lat,lon)
+        print(model_enhance.summary())
 
     # It turns out that localizing probably doesn't help much, at least away from the poles.
     # Train enhance model only, maybe a bit less than before (only 10 epochs)
     #print("Localizing enhance model for this tile...")
     #model_enhance = trainEnhance(model_enhance,dim,demRes,mola2lims,molaTrain,ctxTrain,molaTrainInterp,100,lat,lon)
-    print(model_enhance.summary())
     
     # Define enhance function using models
-    enhancePadding=[6,8]
+    enhancePadding=interpPadding
     def enhanceFunction(ctxInput,molaInput):
         return interpBigImg(model_enhance,ctxInput,molaInput,mola2lims,enhancePadding,dim,True) + \
-                interpBigImg(model_interp,ctxInput,molaInput,molaLims,interpPadding,dim,False)
+               interpBigImg(model_interp,ctxInput,molaInput,molaLims,interpPadding,interp_dim,False)
 
     # There's a bug in the rectbilinearspline function that is called here, for exceptionally
     # large arrays, it would be addressed by chunking it. Want to avoid edge effects, so need some overlap.
     def getEnhancedCTX(factor):
-        return getInterpolatedCTXBig(np.arange(lat-tileSize,lat,tileSize/(factor*demRes)),
+        return getInterpolatedCTXBigOpt(pool, np.arange(lat-tileSize,lat,tileSize/(factor*demRes)),
                                      np.arange(lon,lon+tileSize,tileSize/(factor*demRes)),
                                      ctx,
                                      [lat-tileSize,lat],
                                      [lon,lon+tileSize])
 
     # Enhance until resolution condition met
+    sT = time.time()
     enhancedDem = molaTrain
     for i in range(numEnhance):
-        print("Enhancement "+str(i+1)+" of "+str(numEnhance)+".")
-        print("Current resolution " + str(initialRes/2**(i+1))+ " m.")
-        enhancedDem = enhanceFunction(getEnhancedCTX(2**(i+1)),enhancedDem)
-   
-        # Save output as .tiff
-        print("Saving enhanced DEM")
-        saveDem("../output/enhanced_dem_"+str(lat)+"_"+str(lon)+"_"+str(int(initialRes/2**(i+1)))+"_m",
-                enhancedDem,True)
+        currentResolution = initialRes/2**(i+1)
+        print("[ LOG ] Enhancement "+str(i+1)+" of "+str(numEnhance)+".")
+        print("[ LOG ] Current resolution " + str(currentResolution)+ " m.")
+        enhancedCTX = getEnhancedCTX(2**(i+1))
+        enhancedDem = enhanceFunction(enhancedCTX, enhancedDem)
+    
+    # Saving only the end result
+    print("[ LOG ] Saving enhanced DEM")
+    saveDem("../output/enhanced_dem_"+str(lat)+"_"+str(lon)+"_"+str(int(currentResolution))+"_m",enhancedDem,False)
+
+    print("[ LOG ] Enhance took " + str(int(time.time() - sT)) + " sec")
+
 
 #for lon in range(132,-182,-4):
 #    enhanceMain(-4,lon,150)
@@ -485,44 +580,81 @@ def enhanceMain(lat, lon, res):
 #for lati in range(8,91,4):
 #    for si in range(-1,2,2):
 #        lat=si*lati
-if True:
-#    for lat in range(4,8,4):
+
+
+#
+# Usage:
+#    ctxEnhanceScript.py <latitude> <longitude_start> <longitude_end>
+#
+# 32GB RAM is recommended to run this due to the unoptimized rescale_generic function.
+# Running on an RTX3090 it takes around 3 minutes to enhance a tile to 28m resolution,
+# including training the interpolation model.
+#
+
+if __name__ == "__main__":
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # Currently, memory growth needs to be the same across GPUs
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+            print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+        except RuntimeError as e:
+            # Memory growth must be set before GPUs have been initialized
+            print(e)
+
     if True:
         # Get lat from arg.
         lat = int(sys.argv[1])
-        print("Processing lat: " + str(lat))
+        print("[ LOG ] Processing lat: " + str(lat))
         
         # Download Murray lab data
         murrayLat = lat-4 # Bottom of band, other convention weirdness in Murray data
-        with open('../data/zips/dlscript','w') as f:
-            for lon in range(-180,182,4):
+        with open('../data/zips/dlscript.bat','w') as f:
+            f.write("@ECHO OFF\n")
+            for lon in range(-180,180,4):
                 lon_st = str(lon).zfill(3+int(0.5-0.5*np.sign(lon)))
                 lat_st = str(murrayLat).zfill(2+int(0.5-0.5*np.sign(murrayLat)))
                 f.write("curl -O http://murray-lab.caltech.edu/CTX/tiles/beta01/E"+ \
                         lon_st+"/Murray-Lab_CTX-Mosaic_beta01_E"+lon_st+"_N"+lat_st+"_data.zip\n")
 
-        if True:
+        # Uncomment this to download and unpack the CTX tiles.
+        # I personally prefer to run this separately...
+        #if True:
             # Run
-            os.system("../data/zips/dlscript")
-            os.system("mv *.zip ../data/zips/")
+            #os.system("../data/zips/dlscript.bat")
+            #os.system("mv *.zip ../data/zips/")
             
             # Unzip
-            os.system("unzip '../data/zips/*.zip'")
+            #os.system("unzip '../data/zips/*.zip'")
     
             # Clear data directory
-            os.system("rm ../data/*.tif")
+            #os.system("rm ../data/*.tif")
 
             # Move new tiffs to data directory
-            os.system("mv *.tif ../data/")
+            #os.system("mv *.tif ../data/")
 
             # Clear download directory
-            os.system("rm Murray*")
-            os.system("rm ../data/zips/Murray*")
+            #os.system("rm Murray*")
+            #os.system("rm ../data/zips/Murray*")
             
         # Run enhancement
-        for lon in range(-180,180,4):
-        #for lon in range(60,180,4):    
+        
+        pool = multiprocessing.Pool(2)
+        if True:
             try:
-                enhanceMain(lat,lon,150)
-            except:
+                mola = openDem("../Mars_MGS_MOLA_DEM_mosaic_global_463m.tif")
+                if os.path.isdir("../models/model_enhance_-4_-96"):
+                    # Only load the enhance model once. Speed things up when running in a batch
+                    model_enhance = keras.models.load_model("../models/model_enhance_-4_-96")
+                    print(model_enhance.summary())
+                else:
+                    model_enhance = None
+                for lon in range(int(sys.argv[2]), int(sys.argv[3]), 4):
+                    enhanceMain(pool, mola, lat, lon, 45, model_enhance)
+            except RuntimeError as e:
                 print("FAILCODE: "+str(lat) + " " + str(lon))
+                print(e)
+        pool.close()
+        pool.terminate()
